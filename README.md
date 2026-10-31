@@ -1,6 +1,6 @@
 # DB 운영 실습 (PostgreSQL 16 / Docker / Ubuntu 24.04 WSL2)
 
-DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락)를 직접 해 보고 결과를 기록한 저장소입니다.
+DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링)를 직접 해 보고 결과를 기록한 저장소입니다.
 
 ## 결과 요약
 
@@ -11,6 +11,7 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
 | 3. 백업·복구 | pg_dump -Fc, DROP TABLE 사고 재현 | 21MB 백업 3.5초, 복구 3.6초, PK·권한 복구 |
 | 4. 실행계획·인덱스 | EXPLAIN ANALYZE, 복합 인덱스, 인덱스 정리 | 37~51ms → 0.048ms, 인덱스 67MB → 51MB |
 | 5. 트랜잭션·락 | 터미널 두 개로 동시 수정 재현 | 락 대기, 격리 수준 차이, 데드락 로그 확인 |
+| 6. 모니터링 | 자원·크기 확인, 막힌 세션 종료, VACUUM, pg_stat_statements | 막고 있던 세션 찾아 종료, 죽은 행 10만 → 0, 느린 쿼리 1위 확인 |
 
 ## 환경
 
@@ -28,6 +29,7 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
 | 03_backup_restore.sh | 백업, 사고 재현, 복구, 확인 |
 | 04_index.sql | 실행계획 비교, 인덱스 생성·정리 |
 | 05_transaction_lock.sql | 트랜잭션, 락 대기, 격리 수준, 데드락 (두 세션 순서표) |
+| 06_monitoring.sql | 크기 조회, 막힌 세션 확인·종료, VACUUM, pg_stat_statements |
 
 ## 1. 구축
 - 볼륨(pgdata)을 붙여 PostgreSQL 16 컨테이너 실행
@@ -95,3 +97,34 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
   - docker logs로 서버 로그를 보니 서로 기다린 프로세스 번호와 각자 실행하던 쿼리(id = 10, id = 20)가 남아 있음
 - 배운 점: 트랜잭션을 커밋하지 않고 두면 그동안 다른 창은 계속 기다려야 했다. 데드락은 두 창이 수정 순서를 반대로 해서 생긴 거라, 같은 순서로 수정하면 생기지 않는다.
 - 겪은 오류: 데드락 재현 중 A창에서 + 대신 _를 쳐서 syntax error가 남 → 트랜잭션이 통째로 실패(practice=!#)하면서 잡고 있던 락도 풀려 데드락이 안 생김. 서버 로그를 보고 원인을 알았고, ROLLBACK 후 다시 실행
+
+## 6. 모니터링
+- 서버·컨테이너 자원
+  - df -h /: 1007G 중 3.6G 사용. 그런데 WSL 디스크는 C 드라이브 안의 파일이라 실제로 쓸 수 있는 건 C: 남은 용량(58G)까지
+  - df -h 전체에서 /dev/sdb가 100%로 보였는데, WSL이 붙인 읽기 전용 도구 이미지라 문제없음 → 어느 위치가 찼는지부터 봐야 함
+  - free -h: 전체 3.8Gi(WSL 4GB 제한), available 3.4Gi
+  - docker stats: 쿼리가 없을 때 CPU 0.02%, 메모리 31.5MiB
+- 크기: DB 125MB, orders 테이블 66MB + 인덱스 52MB = 117MB
+- 막힌 세션 찾아서 끊기 (터미널 3개)
+  - A가 트랜잭션을 열어 두고 커밋 안 함, B가 같은 행을 수정하다 멈춤
+  - pg_stat_activity + pg_blocking_pids로 확인: A(pid 132)는 idle in transaction 2분째, B(pid 139)는 blocked_by {132}로 1분 20초째 대기
+  - pg_terminate_backend(132)로 A를 끊으니 B가 바로 UPDATE 1
+  - A는 쿼리를 실행 중인 게 아니라 트랜잭션만 열어 둔 상태라 pg_cancel_backend(쿼리 취소)로는 안 풀리고 세션을 끊어야 했음
+- 죽은 행과 VACUUM
+  - 10만 건을 같은 값으로 UPDATE → n_dead_tup 100,009
+  - VACUUM 후 n_dead_tup 0, 그런데 테이블 크기는 72MB 그대로 (6-2에서 66MB)
+  - VACUUM은 죽은 행 자리를 다시 쓸 수 있게 표시만 하고 파일 크기는 안 줄임. 줄이려면 VACUUM FULL인데 그동안 테이블 전체가 잠김
+  - 10만 건은 전체의 10%라 autovacuum 기본 기준(약 20%)에 못 미쳐서 직접 실행함
+- 느린 쿼리 찾기
+  - ALTER SYSTEM으로 shared_preload_libraries에 pg_stat_statements 추가 → 시작할 때만 읽는 설정이라 docker restart 후 CREATE EXTENSION
+  - 쿼리 몇 개 실행 후 누적 시간 순으로 조회
+
+| 쿼리 | 호출 | 1회 평균 |
+|---|---|---|
+| count(*) WHERE amount > $1 | 3 | 96.35ms |
+| WHERE id = $1 | 2 | 0.57ms |
+| WHERE customer_id = $1 ORDER BY created_at DESC | 1 | 0.87ms |
+
+  - amount에는 인덱스가 없어서 매번 100만 건을 읽음. id = 1과 id = 2는 $1로 묶여 한 줄로 집계됨
+  - customer_id 쿼리가 실습 4(0.048ms)보다 느린 건 재시작 직후라 데이터가 아직 메모리에 없었기 때문으로 보임
+- 배운 점: 멈춘 쿼리는 막힌 쪽이 아니라 막고 있는 세션을 찾아야 풀린다. 끊으면 그 세션 작업은 취소되니까 실제로는 확인하고 끊어야 한다. 느린 쿼리는 pg_stat_statements로 찾고, 실습 4처럼 실행계획을 보고 인덱스를 정하면 된다.
