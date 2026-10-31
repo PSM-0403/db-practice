@@ -1,6 +1,6 @@
 # DB 운영 실습 (PostgreSQL 16 / Docker / Ubuntu 24.04 WSL2)
 
-DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링)를 직접 해 보고 결과를 기록한 저장소입니다.
+DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제)를 직접 해 보고 결과를 기록한 저장소입니다.
 
 ## 결과 요약
 
@@ -12,6 +12,7 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
 | 4. 실행계획·인덱스 | EXPLAIN ANALYZE, 복합 인덱스, 인덱스 정리 | 37~51ms → 0.048ms, 인덱스 67MB → 51MB |
 | 5. 트랜잭션·락 | 터미널 두 개로 동시 수정 재현 | 락 대기, 격리 수준 차이, 데드락 로그 확인 |
 | 6. 모니터링 | 자원·크기 확인, 막힌 세션 종료, VACUUM, pg_stat_statements | 막고 있던 세션 찾아 종료, 죽은 행 10만 → 0, 느린 쿼리 1위 확인 |
+| 7. 복제 | 주 서버 + 복제 서버, 장애 조치 | pg_basebackup으로 복제 서버 구성, 승격 후 쓰기 성공, 남은 슬롯 정리 |
 
 ## 환경
 
@@ -30,6 +31,7 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
 | 04_index.sql | 실행계획 비교, 인덱스 생성·정리 |
 | 05_transaction_lock.sql | 트랜잭션, 락 대기, 격리 수준, 데드락 (두 세션 순서표) |
 | 06_monitoring.sql | 크기 조회, 막힌 세션 확인·종료, VACUUM, pg_stat_statements |
+| 07_replication.sh | 네트워크, 복제 계정, pg_basebackup, 복제 확인, 승격, 정리 (순서표) |
 
 ## 1. 구축
 - 볼륨(pgdata)을 붙여 PostgreSQL 16 컨테이너 실행
@@ -127,6 +129,33 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
   - customer_id 쿼리가 실습 4(0.048ms)보다 느린 건 재시작 직후라 데이터가 아직 메모리에 없었기 때문으로 보임
 - 배운 점: 멈춘 쿼리는 막힌 쪽이 아니라 막고 있는 세션을 찾아야 풀린다. 끊으면 그 세션 작업은 취소되니까 실제로는 확인하고 끊어야 한다. 느린 쿼리는 pg_stat_statements로 찾고, 실습 4처럼 실행계획을 보고 인덱스를 정하면 된다.
 
+## 7. 복제
+- 구성: 주 서버 pg16 + 복제 서버 pg16-replica, Docker 네트워크 pgnet으로 연결
+- 준비
+  - wal_level = replica, max_wal_senders = 10은 기본값으로 이미 켜져 있었음
+  - REPLICATION 권한만 있는 replicator 계정 생성
+  - pg_hba.conf에 다른 컨테이너의 복제 접속이 허용돼 있지 않아서 `host replication replicator all scram-sha-256` 추가, pg_reload_conf()로 재시작 없이 적용
+- 복제 서버 만들기
+  - pg_basebackup으로 주 서버를 통째로 복사 (약 156MB). 실습 3의 pg_dump는 SQL 단위 논리 백업, 이건 파일 그대로 복사하는 물리 백업
+  - -R 옵션으로 복제 서버 설정이 자동으로 들어가서, 켜자마자 로그에 entering standby mode, started streaming WAL from primary
+- 복제 확인
+  - 복제 서버에서 pg_is_in_recovery() = t
+  - 주 서버 pg_stat_replication: state = streaming, sync_state = async
+  - 주 서버에서 INSERT 한 행이 복제 서버에서 바로 조회됨
+  - 복제 서버에서 INSERT → ERROR: cannot execute INSERT in a read-only transaction
+- 장애 조치
+  - 주 서버를 docker stop으로 끄니 복제 서버 로그에 주 서버 연결 실패가 반복됨
+  - 복제 서버에서 pg_promote() → pg_is_in_recovery() = f, INSERT 성공. 이 서버가 새 주 서버가 됨
+- 정리
+  - 복제 서버를 지우고 원래 주 서버를 다시 켜니 슬롯 replica1이 active = f로 남아 있었음 (쌓인 WAL 176 bytes)
+  - 받아 갈 서버가 없어도 슬롯이 있으면 주 서버는 WAL을 지우지 않음 → pg_drop_replication_slot('replica1')로 삭제
+  - 주 서버의 repl_test에는 1, 2번 행만 있음. 승격된 복제 서버에서 넣은 3번은 그 서버와 같이 사라짐
+  - replicator 계정, pg_hba.conf 복제 허용 줄, pgnet 네트워크는 다음 실습을 위해 남겨 둠
+- 배운 점: 복제 서버는 주 서버의 WAL을 받아서 똑같이 다시 실행하는 방식이다. async라 주 서버가 갑자기 죽으면 마지막 변경이 복제 서버에 안 갔을 수 있다. 승격한 뒤 옛 주 서버를 그대로 켜면 주 서버가 두 대가 되니까, 옛 주 서버는 복제 서버로 다시 만들어야 한다. 복제 서버를 없앨 때는 슬롯도 같이 지워야 디스크가 안 찬다.
+- 겪은 오류
+  - docker exec pg16 뒤에 psql을 또 빠뜨림 (실습 2와 같은 실수)
+  - 슬롯 삭제 때 replica1(숫자 1)을 replical(소문자 l)로 쳐서 does not exist → 이름은 조회 결과에서 보고 입력하기
+
 ## 정리: 자주 쓴 명령어
 
 | 하는 일 | 명령 | 실습 |
@@ -143,6 +172,11 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
 | 느린 쿼리 순위 | `pg_stat_statements` (total_exec_time 순) | 6 |
 | 서버 로그 | `docker logs pg16 2>&1 \| grep -A 5 deadlock` | 5 |
 | 서버 자원 | `df -h /`, `free -h`, `docker stats --no-stream pg16` | 6 |
+| 복제 서버 만들기 | `pg_basebackup -h pg16 -U replicator -D 경로 -Xs -P -R -C -S replica1` | 7 |
+| 복제 상태 | `pg_stat_replication`, `pg_replication_slots`, `pg_is_in_recovery()` | 7 |
+| 복제 서버 승격 | `pg_promote()` | 7 |
+| 슬롯 삭제 | `pg_drop_replication_slot('replica1')` | 7 |
+| 접속 규칙 다시 읽기 | `pg_reload_conf()` / 확인은 `pg_hba_file_rules` | 7 |
 
 psql 프롬프트로 지금 상태를 알 수 있다.
 
@@ -167,3 +201,7 @@ psql 프롬프트로 지금 상태를 알 수 있다.
 | 막힌 세션 | idle in transaction 세션이 락을 잡고 있어서, 그 세션을 끊으니 대기가 풀림 | 6 |
 | 죽은 행 | UPDATE 하면 옛 행이 남고, VACUUM이 치워도 파일 크기는 안 줄어듦 | 6 |
 | 느린 쿼리 찾기 | pg_stat_statements에서 인덱스 없는 쿼리가 1회 평균 96ms로 1위 | 6 |
+| WAL과 복제 | 복제 서버는 주 서버의 WAL을 받아서 다시 실행함. 로그에 started streaming WAL from primary | 7 |
+| async 복제 | 주 서버는 복제 서버가 받았는지 안 기다림. 빠르지만 갑자기 죽으면 마지막 변경을 잃을 수 있음 | 7 |
+| 장애 조치 | 주 서버를 끄고 pg_promote()로 복제 서버를 새 주 서버로 올림 | 7 |
+| 복제 슬롯 | 받는 서버가 없어도 WAL을 계속 남겨서, 안 쓰는 슬롯은 지워야 함 | 7 |
