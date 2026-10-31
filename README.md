@@ -37,7 +37,6 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
 - 컨테이너를 삭제하고 다시 만들어도 count = 1000000 유지 → 데이터는 볼륨에 남음
 - 반면 컨테이너 안 /tmp에 둔 백업 파일은 컨테이너 삭제와 함께 사라짐 → 백업은 DB와 다른 곳에 보관해야 함
 
-
 ## 2. 계정·권한
 - 조회 전용 계정 readonly_user 생성 (CONNECT, USAGE, SELECT만 부여)
 - readonly_user로 SELECT count(*) → 1000000 조회 성공
@@ -45,7 +44,6 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
 - REVOKE SELECT 후 조회도 permission denied → GRANT로 다시 부여
 - 배운 점: 필요한 권한만 주는 최소 권한 원칙. 컨테이너 내부 접속은 pg_hba.conf 기본 설정(trust) 때문에 비밀번호 없이 접속됨 → 실제 서버는 외부 접속에 비밀번호 인증 필요
 - 겪은 오류: docker exec 뒤에 psql을 빠뜨려 "executable file not found" → exec 뒤에는 실행할 프로그램이 와야 함
-
 
 ## 3. 백업·복구
 - 상황: orders 테이블을 실수로 삭제(DROP TABLE)한 사고를 재현
@@ -128,3 +126,44 @@ DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션
   - amount에는 인덱스가 없어서 매번 100만 건을 읽음. id = 1과 id = 2는 $1로 묶여 한 줄로 집계됨
   - customer_id 쿼리가 실습 4(0.048ms)보다 느린 건 재시작 직후라 데이터가 아직 메모리에 없었기 때문으로 보임
 - 배운 점: 멈춘 쿼리는 막힌 쪽이 아니라 막고 있는 세션을 찾아야 풀린다. 끊으면 그 세션 작업은 취소되니까 실제로는 확인하고 끊어야 한다. 느린 쿼리는 pg_stat_statements로 찾고, 실습 4처럼 실행계획을 보고 인덱스를 정하면 된다.
+
+## 정리: 자주 쓴 명령어
+
+| 하는 일 | 명령 | 실습 |
+|---|---|---|
+| DB 접속 | `docker exec -it pg16 psql -U postgres -d practice` | 전체 |
+| 백업 | `pg_dump -U postgres -d practice -Fc -f /tmp/practice.dump` | 3 |
+| 백업 파일 꺼내기 | `docker cp pg16:/tmp/practice.dump ~/db-practice/backup/` | 3 |
+| 복구 | `pg_restore -U postgres -d practice --clean --if-exists /tmp/practice.dump` | 3 |
+| 실행계획 | `EXPLAIN ANALYZE 쿼리` | 4 |
+| 접속·대기 확인 | `pg_stat_activity`, `pg_blocking_pids(pid)` | 5, 6 |
+| 쿼리만 취소 / 세션 종료 | `pg_cancel_backend(pid)` / `pg_terminate_backend(pid)` | 6 |
+| 죽은 행 확인 | `pg_stat_user_tables`의 `n_dead_tup` | 6 |
+| 죽은 행 정리 | `VACUUM (VERBOSE) orders` | 6 |
+| 느린 쿼리 순위 | `pg_stat_statements` (total_exec_time 순) | 6 |
+| 서버 로그 | `docker logs pg16 2>&1 \| grep -A 5 deadlock` | 5 |
+| 서버 자원 | `df -h /`, `free -h`, `docker stats --no-stream pg16` | 6 |
+
+psql 프롬프트로 지금 상태를 알 수 있다.
+
+| 프롬프트 | 뜻 |
+|---|---|
+| `practice=#` | 명령 기다리는 중 |
+| `practice-#` | SQL이 안 끝남 (`;` 빠짐). Ctrl + C로 취소 |
+| `practice=*#` | 트랜잭션 진행 중 (COMMIT이나 ROLLBACK 전) |
+| `practice=!#` | 트랜잭션 안에서 에러 남. ROLLBACK 해야 다음 명령 가능 |
+
+## 정리: 개념과 실습에서 본 것
+
+| 개념 | 실습에서 본 것 | 실습 |
+|---|---|---|
+| 최소 권한 | 조회 전용 계정은 SELECT만 되고 DELETE는 permission denied | 2 |
+| 백업과 복구 테스트 | pg_dump로 받은 백업으로 실제 복구해서 건수·PK·권한까지 확인 | 3 |
+| 인덱스 효과 | 7건 골라낼 때 약 1,000배, 33만 건 골라낼 때 약 4배 | 4 |
+| 트랜잭션 | BEGIN 후 ROLLBACK 하면 바꾼 값이 원래대로 돌아옴 | 5 |
+| 행 단위 락 | 같은 행은 기다리고, 다른 행은 안 기다림 | 5 |
+| 격리 수준 | READ COMMITTED는 남이 커밋한 값이 바로 보이고, REPEATABLE READ는 내 트랜잭션이 끝날 때까지 안 보임 | 5 |
+| 데드락 | 두 창이 수정 순서를 반대로 하면 1초쯤 뒤 한쪽이 취소됨 | 5 |
+| 막힌 세션 | idle in transaction 세션이 락을 잡고 있어서, 그 세션을 끊으니 대기가 풀림 | 6 |
+| 죽은 행 | UPDATE 하면 옛 행이 남고, VACUUM이 치워도 파일 크기는 안 줄어듦 | 6 |
+| 느린 쿼리 찾기 | pg_stat_statements에서 인덱스 없는 쿼리가 1회 평균 96ms로 1위 | 6 |
