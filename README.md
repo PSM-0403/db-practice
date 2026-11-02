@@ -1,6 +1,6 @@
 # DB 운영 실습 (PostgreSQL 16 / Docker / Ubuntu 24.04 WSL2)
 
-DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제, 백업 자동화, PITR)를 직접 해 보고 결과를 기록한 저장소입니다.
+DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제, 백업 자동화, PITR, 운영 중 스키마 변경)를 직접 해 보고 결과를 기록한 저장소입니다.
 
 DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 기록하고 있습니다.
 
@@ -17,6 +17,7 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 7. 복제 | 주 서버 + 복제 서버, 장애 조치 | pg_basebackup으로 복제 서버 구성, 승격 후 쓰기 성공, 남은 슬롯 정리 |
 | 8. 백업 자동화 | 백업 스크립트 + cron, 실패·보관 기간·복구 테스트 | 매일 새벽 3시 자동 백업, 실패 시 FAIL 기록, 자동 백업으로 100만 건 복구 확인 |
 | 9. PITR | 베이스 백업 + WAL 보관으로 특정 시각 복구 | DELETE 직전 시각으로 복구, 1001건 되살림, 타임라인 1 → 2 |
+| 10. 운영 중 스키마 변경 | 컬럼 추가, 락 대기 줄, lock_timeout, CREATE INDEX CONCURRENTLY | ALTER 하나가 뒤의 SELECT까지 멈추게 하는 것 확인, 3초 제한, 쓰기를 안 막는 인덱스 생성 |
 
 ## 환경
 
@@ -38,6 +39,7 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 07_replication.sh | 네트워크, 복제 계정, pg_basebackup, 복제 확인, 승격, 정리 (순서표) |
 | 08_backup.sh | 자동 백업 스크립트 (로그 기록, 실패 처리, 7일 보관). cron: `0 3 * * * /home/sumin/db-practice/08_backup.sh` |
 | 09_pitr.sh | WAL 보관 설정, 베이스 백업, 실수 재현, 특정 시각 복구, 정리 (순서표, 5433 서버) |
+| 10_schema_change.sql | 컬럼 추가 비교, 락 대기 줄, lock_timeout, 인덱스 생성 비교 (창 3개 순서표) |
 
 ## 1. 구축
 - 볼륨(pgdata)을 붙여 PostgreSQL 16 컨테이너 실행
@@ -203,6 +205,40 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 - 배운 점: pg_dump(논리 백업)는 백업한 순간으로만 돌아갈 수 있고, 특정 시각으로 돌리려면 물리 백업과 WAL 보관이 같이 있어야 한다. WAL이 하나라도 빠지면 그 뒤로는 복구가 안 되니까 보관 실패를 꼭 확인해야 한다. 복구할 때는 망가진 데이터도 바로 지우지 않고 남겨 둔다.
 - 겪은 오류: 보관 폴더 경로를 /var가 아니라 /val로 쳐서 No such file or directory → 경로는 Tab 자동 완성으로 입력
 
+## 10. 운영 중 스키마 변경
+- 컬럼 추가 세 가지 (`\timing on`으로 시간 측정)
+
+| 명령 | 시간 | 이유 |
+|---|---|---|
+| ADD COLUMN memo text | 22.7ms | 테이블 정의만 바꿈 |
+| ADD COLUMN channel text DEFAULT 'web' | 17.1ms | 고정 기본값은 따로 기록만 함 |
+| ADD COLUMN rnd float DEFAULT random() | 2,174ms | 행마다 값이 달라서 100만 행을 전부 다시 씀. 그동안 테이블 전체가 잠김 |
+
+- 락 대기 줄 (창 3개)
+  - A가 조회만 하고 커밋 안 함 → B의 ALTER가 A를 기다림 → C의 평범한 SELECT도 멈춤
+  - pg_blocking_pids로 보니 B는 A(68)에게, C는 A가 아니라 B(75)에게 막혀 있었음. 강한 락을 기다리는 ALTER가 줄 앞에 서면 뒤에 오는 쿼리가 전부 그 뒤에 줄을 섬
+  - B를 Ctrl + C로 취소하니 C가 바로 풀림
+- lock_timeout
+  - B에서 `SET lock_timeout = '3s'` 후 ALTER → A가 열려 있는 동안은 몇 번을 해도 3초 뒤 `canceling statement due to lock timeout`
+  - 그동안 C는 최대 3초만 기다리고 결과가 나옴
+  - A가 COMMIT 한 뒤에는 ALTER가 바로 끝남
+- 인덱스 만들기
+  - 일반 CREATE INDEX: A가 수정 중이면 기다리고, 그 사이 C의 다른 행 UPDATE도 멈춤. B를 취소하니 C가 풀림
+  - CREATE INDEX CONCURRENTLY: A가 끝나기는 기다리지만, 만드는 동안 C의 UPDATE는 바로 됨. 인덱스 29MB
+  - CONCURRENTLY는 트랜잭션 안에서 못 쓰고, 중간에 취소하면 INVALID 인덱스가 남아서 직접 지워야 함
+- 인덱스가 생겨도 쓰이는지는 조건에 따라 다름 (실습 6에서 느린 쿼리 1위였던 amount 조건)
+
+| 조건 | 골라낸 행 | 실행 방법 | 시간 |
+|---|---|---|---|
+| amount > 50000 | 약 50만 건 | Parallel Seq Scan (인덱스 안 씀) | 192.7ms |
+| amount > 99000 | 10,031건 | Bitmap Index Scan | 84.9ms |
+
+  - 1%만 골라도 인덱스로 찾는 부분은 9.2ms인데 전체는 84.9ms. 1만 건이 6,469페이지에 흩어져 있어서 결국 테이블 대부분을 읽음
+  - 실습 6(96ms)보다 느려진 건 rnd 컬럼 추가로 테이블을 다시 쓰고 행이 커졌기 때문으로 보임
+- 정리: 인덱스와 추가한 컬럼 삭제. DROP COLUMN은 안 보이게 표시만 해서 바로 끝남
+- 배운 점: 스키마 변경은 걸리는 시간보다 락을 기다리는 동안 뒤에 쌓이는 쿼리가 더 위험하다. 변경 전에 오래 열린 트랜잭션이 있는지 보고, lock_timeout을 짧게 걸고, 인덱스는 CONCURRENTLY로 만든다. 느린 쿼리에 인덱스를 만들어도 실제로 쓰이는지는 실행계획으로 확인해야 한다.
+- 헷갈린 것: 결과가 화면보다 넓으면 psql이 페이저(less)로 보여 줌 → q로 나가기, `\pset pager off`로 끄기. psql 안에서도 Tab 자동 완성이 됨
+
 ## 정리: 자주 쓴 명령어
 
 | 하는 일 | 명령 | 실습 |
@@ -232,6 +268,11 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | WAL 강제 마감 | `SELECT pg_switch_wal();` | 9 |
 | WAL 보관 상태 | `pg_stat_archiver` (failed_count) | 9 |
 | 타임라인 확인 | `SELECT timeline_id FROM pg_control_checkpoint();` | 9 |
+| 명령 시간 보기 | psql에서 `\timing on` | 10 |
+| 락 기다리는 시간 제한 | `SET lock_timeout = '3s';` / `RESET lock_timeout;` | 10 |
+| 쓰기를 안 막는 인덱스 생성 | `CREATE INDEX CONCURRENTLY 이름 ON 테이블 (컬럼);` | 10 |
+| 테이블 구조·인덱스 보기 | psql에서 `\d 테이블` | 10 |
+| 페이저 끄기 | psql에서 `\pset pager off` (켜져 있으면 q로 나가기) | 10 |
 
 psql 프롬프트로 지금 상태를 알 수 있다.
 
@@ -263,3 +304,6 @@ psql 프롬프트로 지금 상태를 알 수 있다.
 | 백업 자동화 | 실패도 로그에 남기고 빈 파일은 지움. 오래된 백업은 지움. 자동 백업도 별도 DB에 복구해서 확인 | 8 |
 | PITR | 베이스 백업 + WAL을 목표 시각까지만 다시 실행. DELETE 직전에서 멈추고 1001건 복구 | 9 |
 | 타임라인 | 복구 후 다른 갈래가 되어 번호가 2로 바뀌고 .history 파일이 생김 | 9 |
+| 컬럼 추가 | 기본값이 없거나 고정값이면 바로 끝나고, random() 같은 값은 테이블 전체를 다시 씀 | 10 |
+| 락 대기 줄 | 오래 열린 트랜잭션 + ALTER면 뒤의 SELECT까지 줄을 섬. lock_timeout으로 몇 초 만에 포기하게 함 | 10 |
+| CONCURRENTLY | 인덱스를 만드는 동안 쓰기를 막지 않음. 대신 느리고, 취소하면 INVALID 인덱스가 남음 | 10 |
