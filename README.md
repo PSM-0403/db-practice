@@ -1,6 +1,6 @@
 # DB 운영 실습 (PostgreSQL 16 / Docker / Ubuntu 24.04 WSL2)
 
-DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제, 백업 자동화)를 직접 해 보고 결과를 기록한 저장소입니다.
+DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제, 백업 자동화, PITR)를 직접 해 보고 결과를 기록한 저장소입니다.
 
 DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 기록하고 있습니다.
 
@@ -16,6 +16,7 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 6. 모니터링 | 자원·크기 확인, 막힌 세션 종료, VACUUM, pg_stat_statements | 막고 있던 세션 찾아 종료, 죽은 행 10만 → 0, 느린 쿼리 1위 확인 |
 | 7. 복제 | 주 서버 + 복제 서버, 장애 조치 | pg_basebackup으로 복제 서버 구성, 승격 후 쓰기 성공, 남은 슬롯 정리 |
 | 8. 백업 자동화 | 백업 스크립트 + cron, 실패·보관 기간·복구 테스트 | 매일 새벽 3시 자동 백업, 실패 시 FAIL 기록, 자동 백업으로 100만 건 복구 확인 |
+| 9. PITR | 베이스 백업 + WAL 보관으로 특정 시각 복구 | DELETE 직전 시각으로 복구, 1001건 되살림, 타임라인 1 → 2 |
 
 ## 환경
 
@@ -36,6 +37,7 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 06_monitoring.sql | 크기 조회, 막힌 세션 확인·종료, VACUUM, pg_stat_statements |
 | 07_replication.sh | 네트워크, 복제 계정, pg_basebackup, 복제 확인, 승격, 정리 (순서표) |
 | 08_backup.sh | 자동 백업 스크립트 (로그 기록, 실패 처리, 7일 보관). cron: `0 3 * * * /home/sumin/db-practice/08_backup.sh` |
+| 09_pitr.sh | WAL 보관 설정, 베이스 백업, 실수 재현, 특정 시각 복구, 정리 (순서표, 5433 서버) |
 
 ## 1. 구축
 - 볼륨(pgdata)을 붙여 PostgreSQL 16 컨테이너 실행
@@ -177,6 +179,30 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 - 배운 점: 자동 백업에서 제일 위험한 건 실패했는데 모르는 경우라, 실패도 꼭 기록하고 빈 파일은 지워야 한다. 오래된 백업을 안 지우면 디스크가 계속 찬다. 자동으로 만든 백업도 실제로 복구해 봐야 믿을 수 있다.
 - 헷갈린 것: `ls -l`(소문자 L)과 `ls -1`(숫자 1), `tail -1`과 `tail -l`을 섞어 침. 실습 7의 슬롯 이름 replica1/replical도 같은 이유
 
+## 9. PITR (특정 시각으로 복구)
+- 대상: apt로 직접 설치한 PostgreSQL 16 (5433, [linux/L1](linux/README.md))
+- 상황: 누가 DELETE FROM accounts를 실행함. 백업 시점이 아니라 지우기 직전 시각으로 되돌리고 싶음
+- 원리: 베이스 백업(물리 백업)을 깔고, 그 뒤에 보관해 둔 WAL을 목표 시각까지만 다시 실행
+- WAL 보관 켜기
+  - conf.d/pitr.conf 파일을 새로 만들어 archive_mode = on, archive_command 설정 (원래 postgresql.conf는 안 건드림)
+  - archive_mode는 재시작해야 적용됨
+- 데이터와 백업: accounts 1000건 → pg_basebackup으로 베이스 백업 (약 30MB). 보관 폴더에 WAL 01, 02와 백업 위치 기록 파일(.backup)이 생김
+- 실수 재현
+  - 1001번 행 INSERT (13:09:46 커밋) → now()로 시각 기록 13:10:00.353171+09 → DELETE (13:10:43 커밋) → 0건
+  - pg_switch_wal()로 쓰던 WAL을 마감하니 WAL 03이 보관됨. pg_stat_archiver의 failed_count = 0 확인 (실패가 있으면 WAL이 빠져서 복구 불가)
+- 복구
+  - 서버 정지 → 데이터 폴더 main을 main_broken으로 이름만 바꿔 보존 → 베이스 백업을 cp -a로 복사 (그냥 cp면 소유자가 root가 돼서 안 켜짐)
+  - pitr.conf에 restore_command, recovery_target_time, recovery_target_action = 'promote' 추가 + recovery.signal 파일 생성
+  - 시작하니 로그에 `recovery stopping before commit of transaction 746, time 13:10:43` → DELETE 커밋 직전에서 멈춤
+  - count = 1001, 1001번 행도 살아남. 베이스 백업에는 1000건뿐이었으니 1001번은 WAL을 다시 실행해서 되살아난 것
+- 타임라인
+  - 복구 후 timeline_id가 1 → 2로 바뀌고 보관 폴더에 00000002.history가 생김
+  - 복구한 뒤부터는 원래 WAL(DELETE가 들어 있음)과 다른 갈래라서 번호로 구분함
+  - 로그의 `cp: cannot stat ... .history`는 이전 갈래 기록을 찾다가 없어서 나온 것으로, 처음 복구할 때는 정상
+- 정리: pitr.conf 삭제 후 재시작 (archive_mode = off), main_broken 63MB·base_backup 46MB·wal_archive 81MB 삭제
+- 배운 점: pg_dump(논리 백업)는 백업한 순간으로만 돌아갈 수 있고, 특정 시각으로 돌리려면 물리 백업과 WAL 보관이 같이 있어야 한다. WAL이 하나라도 빠지면 그 뒤로는 복구가 안 되니까 보관 실패를 꼭 확인해야 한다. 복구할 때는 망가진 데이터도 바로 지우지 않고 남겨 둔다.
+- 겪은 오류: 보관 폴더 경로를 /var가 아니라 /val로 쳐서 No such file or directory → 경로는 Tab 자동 완성으로 입력
+
 ## 정리: 자주 쓴 명령어
 
 | 하는 일 | 명령 | 실습 |
@@ -203,6 +229,9 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 오래된 파일 삭제 | `find 경로 -name '*.dump' -mtime +7 -delete` | 8 |
 | 최신 파일 고르기 | `ls -t 경로/*.dump \| head -1` | 8 |
 | 별도 DB에 복구 확인 | `createdb` → `pg_restore -d 새DB < 파일` → `count(*)` → `dropdb` | 8 |
+| WAL 강제 마감 | `SELECT pg_switch_wal();` | 9 |
+| WAL 보관 상태 | `pg_stat_archiver` (failed_count) | 9 |
+| 타임라인 확인 | `SELECT timeline_id FROM pg_control_checkpoint();` | 9 |
 
 psql 프롬프트로 지금 상태를 알 수 있다.
 
@@ -232,3 +261,5 @@ psql 프롬프트로 지금 상태를 알 수 있다.
 | 장애 조치 | 주 서버를 끄고 pg_promote()로 복제 서버를 새 주 서버로 올림 | 7 |
 | 복제 슬롯 | 받는 서버가 없어도 WAL을 계속 남겨서, 안 쓰는 슬롯은 지워야 함 | 7 |
 | 백업 자동화 | 실패도 로그에 남기고 빈 파일은 지움. 오래된 백업은 지움. 자동 백업도 별도 DB에 복구해서 확인 | 8 |
+| PITR | 베이스 백업 + WAL을 목표 시각까지만 다시 실행. DELETE 직전에서 멈추고 1001건 복구 | 9 |
+| 타임라인 | 복구 후 다른 갈래가 되어 번호가 2로 바뀌고 .history 파일이 생김 | 9 |
