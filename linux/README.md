@@ -9,6 +9,7 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 | L1. 직접 설치 | apt로 PostgreSQL 16 설치, systemctl, 파일 위치, 접속 인증 | Docker(5432)와 따로 5433에 설치, peer와 비밀번호 인증 차이 확인 |
 | L2. 사용자·권한 | 사용자·그룹, rwx와 숫자 권한, 새 사용자로 막히는 곳 확인, 권한 장애 재현 | Linux 권한과 DB 권한 두 겹 확인, 데이터 폴더 777로 시작 거부 → 700으로 복구 |
 | L3. 프로세스·자원 | ps, top, vmstat, CPU 부하, kill 신호 비교, kill -9 장애 재현 | 접속 하나 = 프로세스 하나 확인, kill -9 한 번에 전체 접속 끊김 → WAL 복구 약 0.3초, 커밋한 행만 남음 |
+| L4. 디스크 | df, du, 큰 파일 찾기, 300MB 가상 디스크로 꽉 찬 상황 재현 | WAL을 못 써서 PANIC, 재시작도 실패 → 예비 파일 20MB 지워서 복구 |
 
 ## L1. PostgreSQL 직접 설치
 - Docker의 pg16이 5432를 쓰고 있는 상태(`ss -ltn`)에서 `sudo apt install -y postgresql` → 빈 포트를 골라 5433으로 설치됨
@@ -107,6 +108,29 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 - 배운 점: 쿼리가 안 끝나면 pg_cancel_backend, 그다음 pg_terminate_backend 순서로 쓴다. kill -9는 그 접속 하나가 아니라 DB 전체 접속을 끊는다. 복구가 금방 끝난 건 변경이 적어서고, 변경이 많은 서버면 그동안 서비스가 멈춘다.
 - 헷갈린 것: `ps aux --sort=%mem`은 작은 순서라 `-%mem`으로 써야 큰 순서. 20억 번 반복문이 예상보다 빨리 끝나서 처음엔 무한 반복으로 바꿔서 다시 함
 
+## L4. 디스크
+- 현황 보기
+  - `df`는 디스크 전체, `du`는 폴더별 용량. df로 찼는지 보고 du로 범인을 찾음
+  - main 클러스터: pg_wal 49M, base 30M → 변경이 많으면 WAL이 데이터보다 커질 수 있음
+  - `find`로 20MB 넘는 파일을 찾으니 DB 실습 3에서 컨테이너 안 /tmp에 받은 practice.dump가 아직 남아 있었음 (Docker 이미지·컨테이너도 /var/lib/containerd에서 공간을 차지)
+- 작은 디스크 만들기: 진짜 디스크를 채우면 다른 실습까지 망가져서 300MB 파일을 디스크로 사용
+  - fallocate → mkfs.ext4 → mount -o loop 순서. 쓸 수 있는 공간은 244MB (파일 시스템 정보와 root 예약 공간 때문에 300MB보다 작음)
+  - pg_createcluster로 클러스터 small(5434)을 만듦. 빈 DB인데도 약 39MB 사용
+  - 예비 파일 ballast 20MB를 미리 만들어 둠
+- 꽉 채우기: 1KB 행 5만 건 INSERT (테이블 약 50MB + WAL)
+  - 첫 번째 INSERT는 성공, 두 번째에서 `PANIC: could not write to file "pg_wal/xlogtemp.1777": No space left on device`
+  - 전체 접속이 끊기고 복구를 시도했지만 복구도 WAL을 써야 해서 `FATAL: could not write to file ...`, `shutting down due to startup process failure` → 상태 down
+- 복구
+  - pg_wal을 지우면 안 됨. 커밋됐지만 테이블 파일에 아직 반영 안 된 변경이 들어 있어서 데이터가 깨지거나 안 켜질 수 있음
+  - 예비 파일을 지우니 남은 공간 3.3M → 24M, start 하니 redo로 약 90MB를 0.7초에 재실행하고 online
+  - 로그의 `HINT: ... some data is corrupted`는 복구가 중간에 끊긴 적이 있으면 나오는 안내. 그래도 데이터를 확인함 → count = 50000 (첫 번째 INSERT만 남고, 커밋 전에 실패한 두 번째는 사라짐)
+  - TRUNCATE와 CHECKPOINT 후 base 22M, 사용량 56%. pg_wal은 113M로 남음 (재사용하려고 남겨 둔 파일로 보임. 직접 지우지 않음)
+- 정리: pg_dropcluster → umount → rmdir → 이미지 파일 삭제
+- 배운 점: 테이블보다 WAL이 먼저 막히면 명령 하나가 아니라 서버 전체가 멈추고, 공간이 없으면 재시작도 안 된다. 그래서 디스크 사용량은 차기 전에 봐야 한다. 공간이 부족해도 pg_wal은 직접 지우지 않고, 다른 공간을 비운 뒤 PostgreSQL이 정리하게 한다.
+- 겪은 오류
+  - `sudo du -sh 폴더/*`가 No such file or directory → `*`은 sudo가 아니라 지금 셸(sumin)이 먼저 푸는데 700 폴더라 못 풀어서 글자 그대로 넘어감. `sudo bash -c '...'`로 해결
+  - `find /var/lib/home`으로 붙여 쳐서 결과가 비어 있었는데 `2>/dev/null` 때문에 에러도 안 보임
+
 ## 명령어 노트
 
 | 명령 | 하는 일 | 실습 |
@@ -151,3 +175,13 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 | `kill -INT pid` | 쿼리 취소 (pg_cancel_backend와 같음) | L3 |
 | `kill -TERM pid` | 세션 종료 (pg_terminate_backend와 같음) | L3 |
 | `kill -9 pid` | 정리 없이 강제 종료. PostgreSQL에는 쓰지 않기 | L3 |
+| `lsblk` | 디스크 목록과 연결 위치 | L4 |
+| `df -h 경로` / `df -i 경로` | 디스크 용량 / inode(파일 개수) 사용량 | L4 |
+| `sudo bash -c 'du -sh 폴더/* \| sort -h'` | 권한 막힌 폴더의 하위 폴더별 용량 | L4 |
+| `find 경로 -xdev -type f -size +20M` | 큰 파일 찾기 (-xdev: 다른 디스크로 안 넘어감) | L4 |
+| `2>/dev/null` | 에러 메시지 버리기. 실패를 숨기니 주의 | L4 |
+| `fallocate -l 300M 파일` | 그 크기의 파일 만들기 | L4 |
+| `mkfs.ext4` / `mount -o loop 파일 폴더` / `umount 폴더` | 포맷 / 연결 / 연결 해제 | L4 |
+| `rmdir 폴더` | 빈 폴더 삭제 | L4 |
+| `pg_createcluster 16 이름 -d 경로 -p 포트 --start` | 클러스터 새로 만들기 (Ubuntu 설치판) | L4 |
+| `pg_dropcluster 16 이름 --stop` | 클러스터 중지하고 삭제 | L4 |
