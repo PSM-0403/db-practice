@@ -8,6 +8,7 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 |---|---|---|
 | L1. 직접 설치 | apt로 PostgreSQL 16 설치, systemctl, 파일 위치, 접속 인증 | Docker(5432)와 따로 5433에 설치, peer와 비밀번호 인증 차이 확인 |
 | L2. 사용자·권한 | 사용자·그룹, rwx와 숫자 권한, 새 사용자로 막히는 곳 확인, 권한 장애 재현 | Linux 권한과 DB 권한 두 겹 확인, 데이터 폴더 777로 시작 거부 → 700으로 복구 |
+| L3. 프로세스·자원 | ps, top, vmstat, CPU 부하, kill 신호 비교, kill -9 장애 재현 | 접속 하나 = 프로세스 하나 확인, kill -9 한 번에 전체 접속 끊김 → WAL 복구 약 0.3초, 커밋한 행만 남음 |
 
 ## L1. PostgreSQL 직접 설치
 - Docker의 pg16이 5432를 쓰고 있는 상태(`ss -ltn`)에서 `sudo apt install -y postgresql` → 빈 포트를 골라 5433으로 설치됨
@@ -74,6 +75,38 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 - 정리: REVOKE → dropuser → userdel -r 순서 (권한이 남아 있으면 DB 계정이 안 지워짐). userdel의 mail spool not found 메시지는 메일함이 원래 없어서 나온 것
 - 배운 점: 권한을 열어 주는 게 해결책이 아닐 때가 있다. PostgreSQL은 데이터 폴더를 아무나 볼 수 있으면 아예 안 켜진다. usermod는 -a를 빼면 기존 그룹이 다 빠지니까 조심해야 한다.
 
+## L3. 프로세스·자원
+- 프로세스 구조
+  - 대표 프로세스(postmaster) 283의 부모는 1(systemd), checkpointer·walwriter 등의 부모는 전부 283
+  - psql로 접속하니 프로세스가 하나 늘어남. `pg_backend_pid()` 값(912)과 OS의 PID가 같음 → 접속 하나 = 프로세스 하나
+- 쉴 때와 CPU 부하 때 비교 (PL/pgSQL 반복문으로 CPU만 쓰는 쿼리)
+
+| 항목 | 쉴 때 | 부하 중 |
+|---|---|---|
+| top %Cpu us | 2.2 | 26.9 (코어 4개 중 1개) |
+| top wa | 0.0 | 0.0 (디스크를 안 쓰는 쿼리) |
+| 프로세스 912 %CPU | - | 83.3 |
+| vmstat r | 0 | 1~3 |
+
+  - us가 높으면 CPU를 쓰는 중, wa가 높으면 디스크를 기다리는 중
+  - top에서 찾은 PID로 pg_stat_activity를 보면 어떤 쿼리인지 알 수 있음
+  - pg_stat_activity의 query는 state가 active면 실행 중인 쿼리, idle이면 마지막에 실행했던 쿼리. 처음에 쿼리가 끝난 뒤 조회해서 idle로 나옴
+- kill 신호 비교
+
+| SQL | Linux | 결과 |
+|---|---|---|
+| pg_cancel_backend(pid) | kill -INT pid | ERROR, 쿼리만 취소되고 접속 유지 (번호 그대로 912) |
+| pg_terminate_backend(pid) | kill -TERM pid | FATAL, 세션 종료. psql이 다시 접속하니 번호가 1026으로 바뀜 |
+
+- kill -9 장애 재현
+  - C창에서 2000번 행은 커밋, 2001번 행은 커밋 안 한 상태로 두고, 상관없는 접속 1026에 `sudo kill -9`
+  - 로그: `server process (PID 1026) was terminated by signal 9` → `terminating any other active server processes` → `automatic recovery in progress` → `redo starts` → `redo done` → `ready to accept connections`
+  - C창도 끊김: `terminating connection because of crash of another server process`. 프로세스들이 공유 메모리를 같이 쓰는데 하나가 정리 없이 죽으면 메모리가 망가졌을 수 있어서 전부 끊음
+  - 복구는 약 0.3초 (WAL 8kB). 로그의 `invalid record length ... got 0`은 에러가 아니라 WAL 끝에 도착했다는 뜻
+  - 복구 후 2000번은 있고 2001번은 없음 → 커밋된 건 WAL로 살아나고, 커밋 안 한 건 사라짐
+- 배운 점: 쿼리가 안 끝나면 pg_cancel_backend, 그다음 pg_terminate_backend 순서로 쓴다. kill -9는 그 접속 하나가 아니라 DB 전체 접속을 끊는다. 복구가 금방 끝난 건 변경이 적어서고, 변경이 많은 서버면 그동안 서비스가 멈춘다.
+- 헷갈린 것: `ps aux --sort=%mem`은 작은 순서라 `-%mem`으로 써야 큰 순서. 20억 번 반복문이 예상보다 빨리 끝나서 처음엔 무한 반복으로 바꿔서 다시 함
+
 ## 명령어 노트
 
 | 명령 | 하는 일 | 실습 |
@@ -110,3 +143,11 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 | `head -3 파일` | 파일 앞 3줄 | L2 |
 | `chmod 숫자 경로` | 권한 바꾸기 (700, 640, 644, 755) | L2 |
 | `createuser` / `dropuser` | PostgreSQL 계정 만들기 / 삭제 (셸 명령) | L2 |
+| `ps -o pid,ppid,user,cmd -u 사용자` | 그 사용자의 프로세스를 원하는 칸만 | L3 |
+| `ps aux --sort=-%mem \| head -5` | 메모리를 많이 쓰는 순서로 (`-`가 큰 순서) | L3 |
+| `top` / `top -b -n 1 \| head -12` | 프로세스·CPU·메모리 실시간 (q로 종료) / 한 번만 찍기 | L3 |
+| `vmstat 1 5` | 1초 간격 5번. r, free, si/so, us/sy/id/wa. 첫 줄은 부팅 후 평균 | L3 |
+| `free -h` | 메모리. free보다 available을 봄 | L3 |
+| `kill -INT pid` | 쿼리 취소 (pg_cancel_backend와 같음) | L3 |
+| `kill -TERM pid` | 세션 종료 (pg_terminate_backend와 같음) | L3 |
+| `kill -9 pid` | 정리 없이 강제 종료. PostgreSQL에는 쓰지 않기 | L3 |
