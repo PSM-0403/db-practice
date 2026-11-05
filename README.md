@@ -1,6 +1,6 @@
 # DB 운영 실습 (PostgreSQL 16 / Docker / Ubuntu 24.04 WSL2)
 
-DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제, 백업 자동화, PITR, 운영 중 스키마 변경)를 직접 해 보고 결과를 기록한 저장소입니다.
+DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제, 백업 자동화, PITR, 운영 중 스키마 변경, 설정 튜닝)를 직접 해 보고 결과를 기록한 저장소입니다.
 
 DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 기록하고 있습니다.
 
@@ -18,6 +18,7 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 8. 백업 자동화 | 백업 스크립트 + cron, 실패·보관 기간·복구 테스트 | 매일 새벽 3시 자동 백업, 실패 시 FAIL 기록, 자동 백업으로 100만 건 복구 확인 |
 | 9. PITR | 베이스 백업 + WAL 보관으로 특정 시각 복구 | DELETE 직전 시각으로 복구, 1001건 되살림, 타임라인 1 → 2 |
 | 10. 운영 중 스키마 변경 | 컬럼 추가, 락 대기 줄, lock_timeout, CREATE INDEX CONCURRENTLY | ALTER 하나가 뒤의 SELECT까지 멈추게 하는 것 확인, 3초 제한, 쓰기를 안 막는 인덱스 생성 |
+| 11. 설정 튜닝 | work_mem, shared_buffers, 느린 쿼리 로그, random_page_cost 전후 비교 | 메모리 정렬 1,949ms → 1,189ms, 재시작 필요 여부 확인, 인덱스를 골라도 더 느린 경우 확인(339ms vs 629ms) |
 
 ## 환경
 
@@ -40,6 +41,7 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 08_backup.sh | 자동 백업 스크립트 (로그 기록, 실패 처리, 7일 보관). cron: `0 3 * * * /home/sumin/db-practice/08_backup.sh` |
 | 09_pitr.sh | WAL 보관 설정, 베이스 백업, 실수 재현, 특정 시각 복구, 정리 (순서표, 5433 서버) |
 | 10_schema_change.sql | 컬럼 추가 비교, 락 대기 줄, lock_timeout, 인덱스 생성 비교 (창 3개 순서표) |
+| 11_tuning.sql | 설정 확인, work_mem·shared_buffers·random_page_cost 비교, 느린 쿼리 로그 |
 
 ## 1. 구축
 - 볼륨(pgdata)을 붙여 PostgreSQL 16 컨테이너 실행
@@ -239,6 +241,50 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 - 배운 점: 스키마 변경은 걸리는 시간보다 락을 기다리는 동안 뒤에 쌓이는 쿼리가 더 위험하다. 변경 전에 오래 열린 트랜잭션이 있는지 보고, lock_timeout을 짧게 걸고, 인덱스는 CONCURRENTLY로 만든다. 느린 쿼리에 인덱스를 만들어도 실제로 쓰이는지는 실행계획으로 확인해야 한다.
 - 헷갈린 것: 결과가 화면보다 넓으면 psql이 페이저(less)로 보여 줌 → q로 나가기, `\pset pager off`로 끄기. psql 안에서도 Tab 자동 완성이 됨
 
+## 11. 설정 튜닝
+- 현재 설정: 전부 기본값으로 보임. shared_buffers 128MB, work_mem 4MB, maintenance_work_mem 64MB, effective_cache_size 4GB, max_connections 100, max_wal_size 1GB, checkpoint_timeout 5분, random_page_cost 4
+- 바꾸기 전에 pg_settings의 context를 봄. postmaster = 재시작, sighup = 다시 읽기, superuser = 관리자가 세션에서 변경 가능, user = 세션에서 변경
+- work_mem과 정렬 (100만 건 ORDER BY amount, 병렬 끔)
+
+| work_mem | 정렬 방식 | 사용량 | 시간 |
+|---|---|---|---|
+| 4MB (1차) | external merge | 디스크 26MB | 2,307.7ms |
+| 4MB (2차) | external merge | 디스크 26MB | 1,949.0ms |
+| 256MB | quicksort | 메모리 69MB | 1,189.3ms |
+
+  - 256MB는 한 번만 재서 약 1.6배는 대략적인 비교. 첫 측정은 캐시 영향으로 불리했던 것으로 보임
+  - 같은 정렬이 디스크에서는 26MB, 메모리에서는 69MB를 씀. 저장 방식이 달라서 work_mem을 26MB로 잡아도 메모리에 다 안 들어감
+  - work_mem은 정렬·해시 작업 하나당 메모리라서 256MB에 접속 100개면 최악의 경우 25.6GB. 전체 값은 낮게 두고 큰 작업만 세션에서 올리는 게 안전함
+  - pg_stat_database 임시 파일 누적: 25개, 245MB. 한 번 본 값보다 늘어나는 속도를 봐야 함
+- shared_buffers (sum(amount), 테이블 81MB, 병렬 끔)
+
+| shared_buffers | 실행 | hit | read | 시간 |
+|---|---|---|---|---|
+| 128MB | 1차 | 97 | 10,271 | 398.0ms |
+| 128MB | 2차 | 129 | 10,239 | 331.8ms |
+| 512MB | 1차 | 0 | 10,368 | 862.2ms |
+| 512MB | 2차 | 10,368 | 0 | 340.9ms |
+
+  - ALTER SYSTEM과 pg_reload_conf 후에도 SHOW는 128MB, pending_restart = t. 재시작 후 512MB
+  - 128MB에서 2차도 read인 이유: 테이블이 shared_buffers의 1/4(32MB)보다 커서 Seq Scan이 작은 링 버퍼만 씀. 512MB는 1/4이 128MB라 테이블이 캐시에 남음
+  - 그런데 2차끼리 시간은 비슷함. read도 OS 캐시에서 온 것으로 보임. read가 곧 디스크 읽기는 아니고, 값을 올린다고 무조건 빨라지지도 않음
+  - 512MB 1차가 862ms로 느린 이유는 확인 못 함. 재시작 후 새 메모리를 처음 채우는 비용으로 보임
+- log_min_duration_statement = 200ms: 재시작 없이 바로 적용 (pending_restart = f)
+  - `SELECT sum(amount)`는 409.4ms로 로그에 남고, `id = 5` 조회는 안 남음. pg_stat_statements는 누적 통계, 이 로그는 실행 하나하나
+  - shared_buffers를 되돌린 상태로 다시 읽으니 `contains errors; unaffected changes were applied`가 나옴. 장애가 아니라 재시작이 필요한 값을 아직 적용 못 한다는 뜻
+- random_page_cost와 실행계획 (customer_id < 50000, 전체의 약 50%, 각각 두 번째 실행)
+
+| random_page_cost | 실행계획 | 시간 |
+|---|---|---|
+| 4 | Seq Scan | 339.4ms |
+| 1.1 | Index Scan | 629.0ms |
+
+  - 값을 낮추니 플래너가 Index Scan을 골랐지만 이 쿼리에서는 오히려 약 1.9배 느림. 예상 비용 차이가 23,598 vs 24,125로 작았음
+  - 이 쿼리 하나의 결과라서 1.1이 나쁘다는 뜻은 아님. 설정을 바꾸면 실행계획과 실제 시간을 같이 확인해야 함
+- 정리: 전부 되돌림. postgresql.auto.conf에는 shared_preload_libraries = 'pg_stat_statements'만 남음. ALTER SYSTEM RESET ALL은 이 줄까지 지워서 항목별로 되돌림
+- 배운 점: 설정은 값보다 근거가 먼저다. 재시작이 필요한지 보고, 한 번에 하나씩 바꾸고, 전후를 재 본다. hit가 늘거나 플래너가 인덱스를 고른다고 실제로 빨라지는 건 아니다. 이번 비교는 메모리에 다 들어가는 작은 테이블에서 한두 번 잰 것이라 운영 서버에 그대로 적용할 수는 없다.
+- 겪은 오류: 다시 접속하니 페이저가 켜져서 EXPLAIN 결과가 안 남음 → `\pset pager off` 후 재시작해서 다시 측정
+
 ## 정리: 자주 쓴 명령어
 
 | 하는 일 | 명령 | 실습 |
@@ -273,6 +319,11 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 쓰기를 안 막는 인덱스 생성 | `CREATE INDEX CONCURRENTLY 이름 ON 테이블 (컬럼);` | 10 |
 | 테이블 구조·인덱스 보기 | psql에서 `\d 테이블` | 10 |
 | 페이저 끄기 | psql에서 `\pset pager off` (켜져 있으면 q로 나가기) | 10 |
+| 설정값과 적용 방법 보기 | `SELECT name, setting, unit, context, pending_restart FROM pg_settings WHERE name = '...';` | 11 |
+| 서버 설정 바꾸기 / 되돌리기 | `ALTER SYSTEM SET 이름 = 값;` / `ALTER SYSTEM RESET 이름;` | 11 |
+| 설정 다시 읽기 | `SELECT pg_reload_conf();` | 11 |
+| 읽은 페이지 수 보기 | `EXPLAIN (ANALYZE, BUFFERS) 쿼리;` | 11 |
+| 임시 파일 누적량 | `SELECT temp_files, temp_bytes FROM pg_stat_database;` | 11 |
 
 psql 프롬프트로 지금 상태를 알 수 있다.
 
@@ -307,3 +358,6 @@ psql 프롬프트로 지금 상태를 알 수 있다.
 | 컬럼 추가 | 기본값이 없거나 고정값이면 바로 끝나고, random() 같은 값은 테이블 전체를 다시 씀 | 10 |
 | 락 대기 줄 | 오래 열린 트랜잭션 + ALTER면 뒤의 SELECT까지 줄을 섬. lock_timeout으로 몇 초 만에 포기하게 함 | 10 |
 | CONCURRENTLY | 인덱스를 만드는 동안 쓰기를 막지 않음. 대신 느리고, 취소하면 INVALID 인덱스가 남음 | 10 |
+| work_mem | 정렬·해시 작업 하나당 메모리. 부족하면 디스크를 씀. 전체 값을 크게 올리면 OOM 위험 | 11 |
+| shared_buffers | 공용 캐시. 재시작이 필요하고, OS 캐시가 있어 올린다고 무조건 빨라지지 않음 | 11 |
+| random_page_cost | 플래너가 보는 랜덤 읽기 비용. 낮추면 인덱스를 더 고르지만 실제로 빠른지는 재 봐야 함 | 11 |
