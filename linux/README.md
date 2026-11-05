@@ -10,6 +10,7 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 | L2. 사용자·권한 | 사용자·그룹, rwx와 숫자 권한, 새 사용자로 막히는 곳 확인, 권한 장애 재현 | Linux 권한과 DB 권한 두 겹 확인, 데이터 폴더 777로 시작 거부 → 700으로 복구 |
 | L3. 프로세스·자원 | ps, top, vmstat, CPU 부하, kill 신호 비교, kill -9 장애 재현 | 접속 하나 = 프로세스 하나 확인, kill -9 한 번에 전체 접속 끊김 → WAL 복구 약 0.3초, 커밋한 행만 남음 |
 | L4. 디스크 | df, du, 큰 파일 찾기, 300MB 가상 디스크로 꽉 찬 상황 재현 | WAL을 못 써서 PANIC, 재시작도 실패 → 예비 파일 20MB 지워서 복구 |
+| L5. 로그·텍스트 | grep, awk, sed, tail -f로 PostgreSQL 로그 분석 | ERROR 2건·FATAL 4건을 실습과 연결, kill -9 복구 시간 0.28초 계산, 세션 로그에서 칸이 밀리는 것 확인 |
 
 ## L1. PostgreSQL 직접 설치
 - Docker의 pg16이 5432를 쓰고 있는 상태(`ss -ltn`)에서 `sudo apt install -y postgresql` → 빈 포트를 골라 5433으로 설치됨
@@ -131,6 +132,26 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
   - `sudo du -sh 폴더/*`가 No such file or directory → `*`은 sudo가 아니라 지금 셸(sumin)이 먼저 푸는데 700 폴더라 못 풀어서 글자 그대로 넘어감. `sudo bash -c '...'`로 해결
   - `find /var/lib/home`으로 붙여 쳐서 결과가 비어 있었는데 `2>/dev/null` 때문에 에러도 안 보임
 
+## L5. 로그·텍스트
+- 대상: main 클러스터 로그 183줄, 22KB. 권한이 640(postgres:adm)이라 sudo가 필요해서 홈 폴더에 복사본을 만들어 연습
+- 로그 형식: `날짜 시각 KST [PID] 수준: 내용`. 접속 세션의 로그는 PID 뒤에 `사용자@DB`가 들어감
+- grep으로 찾기
+  - ERROR 2, FATAL 4, PANIC 0. L4의 PANIC은 small 클러스터 로그에 있었음
+  - 나온 내용이 실습과 맞음: L2의 role 없음·permission denied·invalid permissions, L3의 cancel·terminate
+  - `grep -n "signal 9"`로 146번째 줄을 찾고, `grep -A 6`으로 뒤에 이어지는 복구 과정을 봄
+  - checkpoint 포함 49줄 + 제외 134줄 = 183줄. 나눠서 세고 전체와 맞춰 보면 필터를 검증할 수 있음
+- awk로 집계
+  - 날짜별: 11-01 26줄, 11-02 101줄, 11-04 44줄, 11-05 7줄. 합계 178줄, 나머지 5줄은 2026으로 시작하지 않는 cp, pg_ctl 메시지
+  - `$5`로 수준을 세니 FATAL이 1개만 나옴. 접속 세션 로그는 `dbuser@pitr`가 `$5`에 들어가서 수준이 `$6`으로 밀림
+  - 수준은 `grep -oE`로 다시 셈: LOG 165, FATAL 4, STATEMENT 3, ERROR 2, DETAIL 2. 패턴에 안 넣은 CONTEXT 2줄을 더하면 178줄
+  - 체크포인트 24번, 쓴 버퍼 합계 1,106, 최대 930(11-02 12:35). 930 버퍼는 쓰기에 93.56초 걸림 (체크포인트는 쓰기를 시간에 나눠서 함)
+- sed로 자르고 바꾸기
+  - `/signal 9/,/ready to accept/` 구간을 뽑으니 13:43:39.391 → 13:43:39.672, 복구까지 약 0.28초
+  - `s/[a-z]+@[a-z0-9]+/USER@DB/`로 사용자 정보를 화면에서만 가림. -i가 없으면 파일은 안 바뀜
+- tail -f: 다른 창에서 없는 테이블을 조회하니 ERROR와 STATEMENT가 바로 나타남 (14:31:03, relation "no_such_table" does not exist)
+- 배운 점: 장애가 나면 FATAL, PANIC부터 찾고 앞뒤 줄을 시각순으로 본다. 칸 번호로 집계하기 전에 형식이 일정한지 확인한다. 한 번 나눠서 세면 합계가 맞는지 검산한다.
+- 겪은 오류: `wc -1`로 쳐서 invalid option (소문자 L이 맞음)
+
 ## 명령어 노트
 
 | 명령 | 하는 일 | 실습 |
@@ -185,3 +206,16 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 | `rmdir 폴더` | 빈 폴더 삭제 | L4 |
 | `pg_createcluster 16 이름 -d 경로 -p 포트 --start` | 클러스터 새로 만들기 (Ubuntu 설치판) | L4 |
 | `pg_dropcluster 16 이름 --stop` | 클러스터 중지하고 삭제 | L4 |
+| `wc -l 파일` | 줄 수 세기 | L5 |
+| `grep -c 단어 파일` | 찾은 줄 수 | L5 |
+| `grep -E "A\|B" 파일` | A 또는 B | L5 |
+| `grep -n` / `-v` / `-o` | 줄 번호 표시 / 없는 줄 / 찾은 부분만 | L5 |
+| `grep -A 6` / `-B 6` | 찾은 줄의 뒤 6줄 / 앞 6줄도 출력 | L5 |
+| `cut -c 1-110` | 각 줄의 1~110번째 글자 | L5 |
+| `awk '{print $1, $5}' 파일` | 공백으로 나눈 칸 출력 | L5 |
+| `awk '/^2026/ {...}'` | 2026으로 시작하는 줄만 처리 | L5 |
+| `awk '{sum += $9} END {print sum}'` | 칸의 합계 | L5 |
+| `sort \| uniq -c \| sort -rn` | 값별 개수를 많은 순서로 | L5 |
+| `sed -n '146,148p'` / `sed -n '/A/,/B/p'` | 줄 범위 / A부터 B까지 출력 | L5 |
+| `sed -E 's/찾기/바꾸기/'` | 찾아 바꿔서 출력 (-i가 있으면 파일을 고침) | L5 |
+| `tail -f 파일` | 추가되는 내용을 계속 출력. Ctrl + C로 종료 | L5 |
