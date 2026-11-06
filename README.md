@@ -1,6 +1,6 @@
 # DB 운영 실습 (PostgreSQL 16 / Docker / Ubuntu 24.04 WSL2)
 
-DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제, 백업 자동화, PITR, 운영 중 스키마 변경, 설정 튜닝)를 직접 해 보고 결과를 기록한 저장소입니다.
+DBA 업무(구축, 권한, 백업·복구, 실행계획·인덱스, 트랜잭션·락, 모니터링, 복제, 백업 자동화, PITR, 운영 중 스키마 변경, 설정 튜닝, MySQL 기초)를 직접 해 보고 결과를 기록한 저장소입니다.
 
 DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 기록하고 있습니다.
 
@@ -19,6 +19,7 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 9. PITR | 베이스 백업 + WAL 보관으로 특정 시각 복구 | DELETE 직전 시각으로 복구, 1001건 되살림, 타임라인 1 → 2 |
 | 10. 운영 중 스키마 변경 | 컬럼 추가, 락 대기 줄, lock_timeout, CREATE INDEX CONCURRENTLY | ALTER 하나가 뒤의 SELECT까지 멈추게 하는 것 확인, 3초 제한, 쓰기를 안 막는 인덱스 생성 |
 | 11. 설정 튜닝 | work_mem, shared_buffers, 느린 쿼리 로그, random_page_cost 전후 비교 | 메모리 정렬 1,949ms → 1,189ms, 재시작 필요 여부 확인, 인덱스를 골라도 더 느린 경우 확인(339ms vs 629ms) |
+| 12. MySQL 기초 | MySQL 8.0 설치, 계정·권한, 100만 건, 실행계획, mysqldump | 조회 545ms → 1.08ms, 복구 후 100만 건과 인덱스 확인, 격리 수준·계정·저장 구조 차이 정리 |
 
 ## 환경
 
@@ -42,6 +43,7 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 09_pitr.sh | WAL 보관 설정, 베이스 백업, 실수 재현, 특정 시각 복구, 정리 (순서표, 5433 서버) |
 | 10_schema_change.sql | 컬럼 추가 비교, 락 대기 줄, lock_timeout, 인덱스 생성 비교 (창 3개 순서표) |
 | 11_tuning.sql | 설정 확인, work_mem·shared_buffers·random_page_cost 비교, 느린 쿼리 로그 |
+| 12_mysql.sh | MySQL 설치, 계정·권한, 데이터 생성, 인덱스 비교, 백업·복구 |
 
 ## 1. 구축
 - 볼륨(pgdata)을 붙여 PostgreSQL 16 컨테이너 실행
@@ -285,6 +287,45 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 - 배운 점: 설정은 값보다 근거가 먼저다. 재시작이 필요한지 보고, 한 번에 하나씩 바꾸고, 전후를 재 본다. hit가 늘거나 플래너가 인덱스를 고른다고 실제로 빨라지는 건 아니다. 이번 비교는 메모리에 다 들어가는 작은 테이블에서 한두 번 잰 것이라 운영 서버에 그대로 적용할 수는 없다.
 - 겪은 오류: 다시 접속하니 페이저가 켜져서 EXPLAIN 결과가 안 남음 → `\pset pager off` 후 재시작해서 다시 측정
 
+## 12. MySQL 기초
+- 환경: Docker mysql:8.0 (8.0.46), 컨테이너 mysql8, 볼륨 mysqldata, 포트 3306. 비밀번호는 read -s로 입력
+- PostgreSQL과 다른 점
+
+| 항목 | PostgreSQL | MySQL |
+|---|---|---|
+| 기본 격리 수준 | READ COMMITTED | REPEATABLE READ |
+| 계정 구분 | 이름 | 이름 + 접속 위치 ('이름'@'%') |
+| 접속 위치 제한 | pg_hba.conf | 계정 자체에 포함 |
+| 저장 구조 | 테이블과 인덱스를 따로 저장 | InnoDB는 기본 키 순서로 데이터를 저장 |
+| 숫자 만들기 | generate_series | 재귀 CTE |
+
+- 계정·권한: readonly_user에 practice.* SELECT만 부여. SELECT 성공, DELETE는 `ERROR 1142`
+  - GRANT USAGE는 접속만 가능하다는 뜻. root@%와 root@localhost는 서로 다른 계정
+- 100만 건: INSERT 11.01초, 테이블 51MB
+  - table_rows는 997,347로 추정치. count(*)는 1,000,000
+  - 기본 키만 있을 때 index_mb가 0. 기본 키가 데이터 안에 포함되어 있기 때문
+- 실행계획 (고객 12345의 최근 10건. 이 고객은 10건뿐)
+
+| 단계 | type | 정렬 | 시간 |
+|---|---|---|---|
+| 인덱스 없음 | ALL | filesort | 545ms |
+| customer_id | ref | filesort | 1.11ms |
+| customer_id, created_at DESC | ref | 없음 | 1.08ms |
+
+  - 복합 인덱스로 filesort가 사라졌지만 시간 차이는 거의 없음. 10건뿐이라 정렬 부담이 원래 작았음
+  - 복합 인덱스 26MB. 보조 인덱스에는 기본 키 값도 함께 저장됨
+  - 인덱스가 없을 때 filtered 10%는 어림값. 인덱스를 만드니 rows 10, filtered 100으로 정확해짐
+- mysqldump 백업·복구
+  - --single-transaction으로 InnoDB 테이블을 잠그지 않고 일관된 스냅샷으로 백업. 2.3초, 54MB
+  - INSERT INTO는 56줄. 한 줄에 여러 행을 묶어 넣음 (extended-insert)
+  - practice_restore에 복구 20.6초. count 1,000,000, PRIMARY와 idx_customer_created까지 복구됨
+  - 실습 3의 pg_dump -Fc는 21MB, 복구 3.6초. 이번 덤프는 압축 안 한 SQL 텍스트라 형식 차이가 있어서 DB 성능 비교로 보면 안 됨
+- 배운 점: SQL은 대부분 같아도 격리 수준, 계정 구조, 저장 구조가 다르다. 이관이나 운영에서는 문법보다 이런 차이를 먼저 봐야 한다.
+- 겪은 오류
+  - `SELECT @default_storage_engine`이 NULL. `@`는 사용자 변수, `@@`가 시스템 설정
+  - INSERT를 실수로 두 번 실행해서 200만 건이 됨. TRUNCATE로 비우고 다시 넣음 (되돌릴 수 없으니 운영에서는 조심)
+  - 실습 계정 비밀번호가 화면 캡처에 보임. ALTER USER로 바꿔야 하고, 캡처를 공유할 때는 비밀번호 줄을 가려야 함
+
 ## 정리: 자주 쓴 명령어
 
 | 하는 일 | 명령 | 실습 |
@@ -324,6 +365,11 @@ DB 운영에 필요한 Linux 기본기는 [linux/](linux/README.md)에 따로 �
 | 설정 다시 읽기 | `SELECT pg_reload_conf();` | 11 |
 | 읽은 페이지 수 보기 | `EXPLAIN (ANALYZE, BUFFERS) 쿼리;` | 11 |
 | 임시 파일 누적량 | `SELECT temp_files, temp_bytes FROM pg_stat_database;` | 11 |
+| MySQL 접속 | `docker exec -it mysql8 mysql -uroot -p` | 12 |
+| MySQL 목록 보기 | `SHOW DATABASES;` / `USE DB;` / `SHOW TABLES;` / `DESC 테이블;` | 12 |
+| MySQL 시스템 설정 보기 | `SHOW VARIABLES LIKE '이름';` / `SELECT @@이름;` | 12 |
+| MySQL 세로 출력 | 쿼리 끝의 `;` 대신 `\G` | 12 |
+| MySQL 논리 백업 | `mysqldump -uroot --single-transaction DB > 파일` | 12 |
 
 psql 프롬프트로 지금 상태를 알 수 있다.
 
@@ -361,3 +407,6 @@ psql 프롬프트로 지금 상태를 알 수 있다.
 | work_mem | 정렬·해시 작업 하나당 메모리. 부족하면 디스크를 씀. 전체 값을 크게 올리면 OOM 위험 | 11 |
 | shared_buffers | 공용 캐시. 재시작이 필요하고, OS 캐시가 있어 올린다고 무조건 빨라지지 않음 | 11 |
 | random_page_cost | 플래너가 보는 랜덤 읽기 비용. 낮추면 인덱스를 더 고르지만 실제로 빠른지는 재 봐야 함 | 11 |
+| 클러스터드 인덱스 | InnoDB는 기본 키 순서로 데이터를 저장. 보조 인덱스에는 기본 키 값이 함께 저장됨 | 12 |
+| MySQL 계정 | 이름과 접속 위치로 구분. 'a'@'localhost'와 'a'@'%'는 다른 계정 | 12 |
+| filesort | 인덱스 순서로 해결 못 해서 별도로 정렬. 꼭 디스크를 쓰는 건 아님 | 12 |
