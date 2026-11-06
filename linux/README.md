@@ -11,6 +11,7 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 | L3. 프로세스·자원 | ps, top, vmstat, CPU 부하, kill 신호 비교, kill -9 장애 재현 | 접속 하나 = 프로세스 하나 확인, kill -9 한 번에 전체 접속 끊김 → WAL 복구 약 0.3초, 커밋한 행만 남음 |
 | L4. 디스크 | df, du, 큰 파일 찾기, 300MB 가상 디스크로 꽉 찬 상황 재현 | WAL을 못 써서 PANIC, 재시작도 실패 → 예비 파일 20MB 지워서 복구 |
 | L5. 로그·텍스트 | grep, awk, sed, tail -f로 PostgreSQL 로그 분석 | ERROR 2건·FATAL 4건을 실습과 연결, kill -9 복구 시간 0.28초 계산, 세션 로그에서 칸이 밀리는 것 확인 |
+| L6. 네트워크 | IP·포트 확인, nc 연결 테스트, 접속 실패 단계별 재현, 방화벽 차단 | refused, no pg_hba.conf entry, password failed, timed out을 직접 만들어서 구분 |
 
 ## L1. PostgreSQL 직접 설치
 - Docker의 pg16이 5432를 쓰고 있는 상태(`ss -ltn`)에서 `sudo apt install -y postgresql` → 빈 포트를 골라 5433으로 설치됨
@@ -152,6 +153,32 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 - 배운 점: 장애가 나면 FATAL, PANIC부터 찾고 앞뒤 줄을 시각순으로 본다. 칸 번호로 집계하기 전에 형식이 일정한지 확인한다. 한 번 나눠서 세면 합계가 맞는지 검산한다.
 - 겪은 오류: `wc -1`로 쳐서 invalid option (소문자 L이 맞음)
 
+## L6. 네트워크
+- 장치와 포트
+  - lo 127.0.0.1, eth0 172.26.98.10, docker0 172.17.0.1, br-f7fe... 172.18.0.1(pgnet으로 보임), veth는 컨테이너와 연결
+  - 5433은 127.0.0.1(apt 설치판, 이 안에서만), 5432·3306은 0.0.0.0(docker-proxy, 모든 장치에서)
+  - docker ps의 33060/tcp는 `->`가 없어서 컨테이너 안에만 열려 있음
+  - `-p 3306:3306`은 0.0.0.0으로 열림. 운영 서버면 외부 노출 위험
+- nc 연결 테스트
+  - 127.0.0.1:5433 성공, 172.26.98.10:5433 거부, 172.26.98.10:5432 성공, 127.0.0.1:5999 거부
+- 접속 실패 단계별 재현 (5433)
+
+| 단계 | 한 일 | 에러 | 볼 곳 |
+|---|---|---|---|
+| 포트 | listen_addresses = localhost 상태 | `Connection refused` | 서버 기동, listen_addresses, 포트 |
+| 접속 규칙 | listen_addresses = '*' + 재시작 | `no pg_hba.conf entry` | pg_hba.conf |
+| 인증 | 172.26.98.10/32 scram 줄 추가 + reload | `password authentication failed` | 계정, 비밀번호 |
+| 방화벽 | iptables INPUT DROP | `timed out` (3초 대기) | 방화벽, 경로 |
+
+  - listen_addresses는 재시작 필요, pg_hba.conf는 reload로 적용. 수정 후 pg_hba_file_rules의 error 칸으로 문법 확인 (133번째 줄)
+  - FATAL이 두 줄인 건 psql이 SSL로 먼저 시도하고 암호화 없이 다시 시도해서. 로그 PID도 2677, 2678로 다름
+  - refused는 바로 나오고, DROP은 응답이 없어서 끝까지 기다림
+- 실제 연결: nettest로 접속해 두고 비교. `ss -tn`의 포트와 pg_stat_activity의 client_port가 46592로 같음
+  - 서버 쪽은 5433, 접속한 쪽은 임시 포트. 같은 서버 안에서 접속해서 ESTAB 줄이 두 줄 보임
+- 정리: nettest 삭제, pg_hba.conf 복원, listen_addresses RESET 후 재시작, iptables 규칙 삭제. 172.26.98.10:5433 다시 거부되는 것까지 확인
+- 배운 점: 접속이 안 되면 에러 메시지로 어느 단계에서 막혔는지부터 구분한다. refused는 포트와 listen_addresses, no pg_hba.conf entry는 접속 규칙, password failed는 계정, timeout은 방화벽이나 경로를 먼저 본다. 방화벽 규칙과 접속 설정은 범위를 좁게 열고 끝나면 되돌린다.
+- 헷갈린 것: `sudo -u`만 치고 Tab을 누르면 사용자 목록이 나옴. 큰따옴표를 닫기 전에 Enter를 치면 `>`가 나오고 입력을 계속 기다림
+
 ## 명령어 노트
 
 | 명령 | 하는 일 | 실습 |
@@ -219,3 +246,13 @@ DB 운영에 필요한 Linux 기본기를 PostgreSQL을 직접 다루면서 익�
 | `sed -n '146,148p'` / `sed -n '/A/,/B/p'` | 줄 범위 / A부터 B까지 출력 | L5 |
 | `sed -E 's/찾기/바꾸기/'` | 찾아 바꿔서 출력 (-i가 있으면 파일을 고침) | L5 |
 | `tail -f 파일` | 추가되는 내용을 계속 출력. Ctrl + C로 종료 | L5 |
+| `ip -br addr` | 네트워크 장치와 IP | L6 |
+| `ip route` | 패킷을 보내는 경로. default는 모르는 주소가 가는 곳 | L6 |
+| `getent hosts 이름` | DNS로 찾은 주소 | L6 |
+| `sudo ss -ltnp` | 듣고 있는 TCP 포트와 프로세스 | L6 |
+| `ss -tn` | 맺어진 TCP 연결 (ESTAB) | L6 |
+| `nc -zv -w 2 주소 포트` | 포트까지 연결되는지 테스트 | L6 |
+| `pg_isready -h 주소 -p 포트` | PostgreSQL이 접속을 받는지 확인 | L6 |
+| `sudo iptables -I INPUT -p tcp --dport 포트 -j DROP` | 그 포트로 오는 패킷 버리기 | L6 |
+| `sudo iptables -D INPUT -p tcp --dport 포트 -j DROP` | 위 규칙 삭제 | L6 |
+| `sudo iptables -L INPUT -n --line-numbers` | 방화벽 규칙 보기 | L6 |
